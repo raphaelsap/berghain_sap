@@ -361,10 +361,31 @@ class GameState:
 
         # Outstanding needs per attribute
         needed = self.needed_per_attr()
+
         # If the candidate satisfies any outstanding need, accept them
-        helpful = [attr for attr in candidate_attrs if needed.get(attr, 0) > 0]
+        helpful = [a for a in candidate_attrs if needed.get(a, 0) > 0]
         if helpful:
-            return True, f"helpful: satisfies unmet {sorted(helpful)}"
+            # Compute tightness for all unmet
+            R = self.remaining_seats()
+            eps = 1e-9
+            tightness = {}
+            for a, s in needed.items():
+                if s <= 0:
+                    continue
+                p = max(eps, self.current_probability(a))
+                tightness[a] = s / (max(1, R) * p)
+
+            # Candidate's best attribute tightness vs global best
+            cand_best = max((tightness[a] for a in helpful if a in tightness), default=-1.0)
+            global_best = max(tightness.values(), default=-1.0)
+
+            # Only accept if candidate helps a near-tightest attribute
+            # (tau ~ 0.85–0.9 is a good starting point)
+            tau = 0.9
+            if cand_best >= tau * global_best:
+                return True, f"helpful (priority): {sorted(helpful)}"
+            else:
+                return False, f"skip helpful (low priority): {sorted(helpful)} vs tightest"
 
         # Candidate does not help any constraints.  Compute whether we can
         # still meet every outstanding constraint if we admit them.
