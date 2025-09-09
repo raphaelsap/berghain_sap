@@ -132,6 +132,14 @@ class GameState:
     history_success: list = field(default_factory=list)
     history_len: int = 60
 
+    # --- Prudence automatique pour quotas rares ---
+    # p<threshold => considéré "rare"
+    rare_p_thresh: float = 0.10
+    # multiplicateur max appliqué à k pour un attribut très rare et très tendu
+    rare_boost_max: float = 2.0
+    # intensité de l'effet (0.0 = désactivé, 1.0 = par défaut)
+    rare_beta: float = 1.0
+
     # Dynamic state
     accepted_total: int = 0
     rejected_count: int = 0
@@ -179,6 +187,26 @@ class GameState:
         """
         progress = self.accepted_total / max(1, self.target)
         return max(self.k_relax_min, self.cushion - (self.cushion - self.k_relax_min) * progress)
+
+    # ----- RARETÉ : pondération et k par attribut -----
+    def rarity_weight(self, p_i: float, s_i: int, R: int) -> float:
+        """
+        Calcule un poids de rareté/tension dans [1, rare_boost_max].
+        - scarcity in [0,1]: plus p_i est petit (< rare_p_thresh), plus c'est rare.
+        - pressure in [0,1]: plus la part s_i/R est grande, plus le besoin est tendu.
+        """
+        if self.rare_beta <= 0.0:
+            return 1.0
+        if p_i <= 0.0:
+            return self.rare_boost_max
+        scarcity = max(0.0, min(1.0, (self.rare_p_thresh - p_i) / max(1e-9, self.rare_p_thresh)))
+        pressure = 0.0 if R <= 0 else max(0.0, min(1.0, s_i / float(R)))
+        raw = 1.0 + self.rare_beta * scarcity * (0.5 + 0.5 * pressure)
+        return max(1.0, min(self.rare_boost_max, raw))
+
+    def per_attr_k(self, p_i: float, s_i: int, R: int) -> float:
+        """k effectif pour un attribut donné, amplifié si rare/tendu."""
+        return self.effective_k() * self.rarity_weight(p_i, s_i, R)
 
     def seats_required_normal(self, need: int, p: float, k: float, max_n: int) -> int:
         """Smallest n such that n*p - k*sqrt(n*p*(1-p)) >= need. Binary search."""
@@ -378,7 +406,7 @@ class GameState:
                 )
         # Per-attribute seats-budget guard (stronger, uses conservative p)
         if self.use_seats_budget_guard:
-            k_eff = self.effective_k()
+            k_eff_base = self.effective_k()
             sum_required = 0
             worst_attr = None
             worst_req = -1
@@ -386,7 +414,9 @@ class GameState:
                 if s_i <= 0:
                     continue
                 p_i = self.current_probability(attr)
-                n_req = self.seats_required_normal(s_i, p_i, k_eff, new_R)
+               # k renforcé si l'attribut est rare/tendu
+                k_attr = k_eff_base * self.rarity_weight(p_i, s_i, new_R)
+                n_req = self.seats_required_normal(s_i, p_i, k_attr, new_R)
                 if n_req > worst_req:
                     worst_req = n_req
                     worst_attr = attr
@@ -421,14 +451,18 @@ class GameState:
             return True, "safe: fast expected supply ok"
         if self.policy == "chernoff":
             # Bonferroni split of alpha across unmet attributes
-            unmet = [a for a, s in needed.items() if s > 0]
+            unmet = [(a, s) for a, s in needed.items() if s > 0]
             m = max(1, len(unmet))
-            per_attr_alpha = float(self.alpha) / float(m)
+            # On alloue un alpha_i PLUS PETIT aux attributs rares (plus strict)
+            inv_weights = []
+            for a, s_i in unmet:
+                p_i = self.current_probability(a)
+                w = self.rarity_weight(p_i, s_i, new_R)  # w>=1 si rare/tendu
+                inv_weights.append(1.0 / max(1e-9, w))
+            sum_inv = sum(inv_weights) if inv_weights else 1.0
             worst_p = 0.0
             worst_attr = None
-            for attr, s_i in needed.items():
-                if s_i == 0:
-                    continue
+            for idx, (attr, s_i) in enumerate(unmet):
                 p_i = self.current_probability(attr)
                 if p_i <= 0.0:
                     return False, f"unsafe: need {attr} but p=0"
@@ -438,6 +472,8 @@ class GameState:
                 # If need exceeds mean, the bound is trivially 1 (unsafe)
                 if s_i >= mu:
                     return False, f"unsafe: need {attr}={s_i} >= mu={mu:.2f}"
+                # alpha_i : plus rare => plus strict (alpha_i plus petit)
+                per_attr_alpha = float(self.alpha) * (inv_weights[idx] / sum_inv)
                 ratio = max(0.0, min(1.0, s_i / mu))
                 delta = 1.0 - ratio  # in (0,1]
                 # Lower-tail Chernoff: P[X < (1-d)mu] <= exp(-mu * d^2 / 2)
@@ -468,12 +504,14 @@ class GameState:
                     return False, f"unsafe: need {attr} but p=0"
                 mu = new_R * p_i
                 sigma = math.sqrt(mu * (1.0 - p_i)) if 0.0 < p_i < 1.0 else 0.0
-                lower_bound = mu - self.cushion * sigma
+                # k renforcé pour attribut rare/tendu
+                k_attr = self.per_attr_k(p_i, s_i, new_R)
+                lower_bound = mu - k_attr * sigma
                 # If the lower bound falls short of the required count, reject
                 if lower_bound < s_i:
                     return False, (
                         f"unsafe: normal LB<{s_i} for {attr} "
-                        f"(mu={mu:.2f}, sigma={sigma:.2f}, LB={lower_bound:.2f})"
+                        f"(mu={mu:.2f}, sigma={sigma:.2f}, k={k_attr:.2f}, LB={lower_bound:.2f})"
                     )
                 # Track tightness via z = (mu - s) / sigma (higher is safer)
                 if sigma > 0:
